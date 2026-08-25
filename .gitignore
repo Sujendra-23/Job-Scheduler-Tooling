@@ -1,0 +1,11 @@
+.rocketride/
+
+# build artifacts
+/bin/
+mem/allocator
+
+# generated simulation output (any run's event log)
+*.jsonl
+allocator_output.txt
+Output1
+Output2
