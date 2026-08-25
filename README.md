@@ -53,6 +53,56 @@ and `-nodes` (cluster topology as `name:cpu:memMB:gpus,...`, default
 `node-a:16:65536:2,node-b:16:65536:2,node-c:32:131072:4`) if you want to
 try a shorter run or a different cluster shape without editing the code.
 
+## Giving it input and seeing the output
+
+The two binaries are separate: `scheduler` generates and runs a simulated
+workload (that's where you supply input), `tracer` reads the log
+`scheduler` wrote and reports on it (that's where you see output).
+
+**1. Run the scheduler with your own input:**
+
+```bash
+./bin/scheduler -jobs 40 -seed 1 -out /tmp/run.jsonl
+```
+
+| Flag | Meaning |
+|---|---|
+| `-jobs` | how many synthetic jobs to generate (default 40) |
+| `-seed` | random seed - same seed + same `-jobs` always reproduces the exact same run |
+| `-out` | where to write the JSONL event log |
+| `-max-ticks` | how many simulated ticks to run before stopping (default 200) |
+| `-nodes` | cluster topology, `name:cpu:memMB:gpus,...` (default: two 16-core nodes + one 32-core node) |
+| `-pg-dsn` | optional Postgres DSN - also writes every event to the `scheduling_events` table |
+
+This prints a short on-screen summary (ticks run, jobs left pending/running,
+final utilization per node) and writes the full event-by-event detail to
+the file you named with `-out`.
+
+**2. See the output with the tracer:**
+
+```bash
+# aggregate wait-time stats across every job in the run
+./bin/tracer -log /tmp/run.jsonl -summary
+
+# full timeline for one specific job
+./bin/tracer -log /tmp/run.jsonl -job job-005
+```
+
+`-summary` prints min/median/max/mean wait time across all jobs.
+`-job <id>` prints that job's full history - submitted, any times it was
+told to keep waiting, preempted (if it happened), started, completed -
+plus its total wait time.
+
+**3. Or read the raw output yourself:**
+
+```bash
+cat /tmp/run.jsonl
+```
+
+Every line is one JSON event (`submitted`, `started`, `preempted`,
+`completed`, or `wait_reason`) with a timestamp, job ID, priority, and
+node name where relevant - `tracer` is just a formatter over this file.
+
 ## Sample results
 
 A 40-job run against the default 3-node pool (16/16/32 CPU cores, 2/2/4
@@ -94,14 +144,34 @@ first-fit, the expected direction of the effect.
 ## Tests
 
 ```bash
+make test
+# equivalent to:
 go test ./... -v -cover
 ```
 
-`internal/queue`, `internal/resource`, and `internal/telemetry` have unit
-tests; `cmd/tracer`'s parsing/reporting logic (`loadEvents`, `traceJob`,
-`summary`) and `cmd/scheduler`'s node-spec parsing are also covered.
+This runs every `_test.go` file in the module and prints each test name
+plus a coverage percentage per package, e.g.:
+
+```
+=== RUN   TestPopReturnsHighestPriorityFirst
+--- PASS: TestPopReturnsHighestPriorityFirst (0.00s)
+...
+ok  	scheduler/internal/queue	0.23s	coverage: 72.2% of statements
+```
+
+What's covered:
+
+| Package | Tested |
+|---|---|
+| `internal/queue` | priority ordering, FIFO-within-tier, empty pop, peek |
+| `internal/resource` | fit/reserve/release, best-fit slack selection, no-fit case |
+| `internal/telemetry` | event recorder creates/writes the JSONL file, nil-DB safety, bad-path error |
+| `cmd/tracer` | log parsing (incl. malformed lines), job timeline reporting, summary stats |
+| `cmd/scheduler` | `-nodes` spec parsing (valid, default, malformed) |
+
 `cmd/scheduler`'s `main` itself (flag wiring, DB connection) and
-`mem/allocator.c` are exercised by running them, not by unit tests.
+`mem/allocator.c` are exercised by running them (see **Running it** above
+and `make allocator`), not by unit tests.
 
 ## Known limitations
 
