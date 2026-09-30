@@ -14,6 +14,31 @@ free-list memory allocator study.
 - `gcc` (only for `make allocator`)
 - PostgreSQL (optional, only for `make run-sim-pg`)
 
+## Quick start with PyTorch
+
+Keep the ML dependencies isolated in a project-local virtual environment:
+
+```bash
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-ml.txt
+
+make build
+make run-distributed
+```
+
+You can verify that the real torchvision backend is being used by inspecting a
+completion event:
+
+```bash
+tail -n 1 scheduling_events.jsonl
+```
+
+Its `detail` field will contain `"backend":"torchvision-resnet50"`. If the
+virtual environment is not activated or PyTorch cannot be imported,
+`-backend auto` uses the clearly labeled `cpu-reference-mlp` backend instead.
+
 ## Layout
 
 ```
@@ -61,6 +86,10 @@ make run-distributed
 # Deterministic CI/demo run; all first attempts fail, exercising every action.
 ./bin/dispatcher -jobs 6 -workers 3 -backend cpu-reference \
   -failure-rate 1 -seed 7 -out /tmp/distributed.jsonl
+
+# Require the real torchvision ResNet-50 backend (no automatic fallback).
+./bin/dispatcher -jobs 4 -workers 2 -python .venv/bin/python \
+  -backend torch -failure-rate 0 -out /tmp/resnet50.jsonl
 ```
 
 The second command produces OOM, transient reset, and corrupt-input failures.
@@ -99,6 +128,19 @@ Telemetry now covers `failed`, `triaged`, `retried`, `adjusted`, and
 `escalated` in addition to the original lifecycle events. Each record includes
 model, batch size, attempt, worker ID, and triage action. The Postgres schema
 contains idempotent migration statements for these fields.
+
+### Verified real-model run
+
+The torchvision path has been executed end to end on Apple Silicon using
+PyTorch 2.14.0 and torchvision 0.29.0. A batch-size-1 ResNet-50 job was claimed
+by a worker process, completed successfully, and recorded:
+
+```json
+{"backend":"torchvision-resnet50","device":"cpu","batch_size":1,"precision":"fp32","latency_ms":18.2936,"top1_class_ids":[844]}
+```
+
+This is a measured local result, not a projected GPU benchmark. Hardware,
+backend, model warm-up, and batch size materially affect latency.
 
 ## Original scheduler simulation
 
