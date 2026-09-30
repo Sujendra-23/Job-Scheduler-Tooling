@@ -1,16 +1,35 @@
 -- Scheduling telemetry schema. One row per scheduling decision (submitted,
--- started, preempted, completed, wait_reason), written by
+-- started, failed, triaged, retried/adjusted/escalated, completed, or
+-- wait_reason), written by
 -- internal/telemetry.Recorder alongside the JSONL log.
 
 CREATE TABLE IF NOT EXISTS scheduling_events (
     id          BIGSERIAL PRIMARY KEY,
     timestamp   TIMESTAMPTZ NOT NULL,
     job_id      TEXT NOT NULL,
-    event_type  TEXT NOT NULL CHECK (event_type IN ('submitted', 'started', 'preempted', 'completed', 'wait_reason')),
+    event_type  TEXT NOT NULL CHECK (event_type IN (
+        'submitted', 'started', 'preempted', 'completed', 'wait_reason',
+        'failed', 'triaged', 'retried', 'adjusted', 'escalated'
+    )),
     node_name   TEXT,
     priority    INTEGER NOT NULL,
+    model       TEXT,
+    batch_size  INTEGER,
+    attempt     INTEGER,
+    triage_action TEXT,
     detail      TEXT
 );
+
+-- Safe migration for databases created by earlier project revisions.
+ALTER TABLE scheduling_events ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE scheduling_events ADD COLUMN IF NOT EXISTS batch_size INTEGER;
+ALTER TABLE scheduling_events ADD COLUMN IF NOT EXISTS attempt INTEGER;
+ALTER TABLE scheduling_events ADD COLUMN IF NOT EXISTS triage_action TEXT;
+ALTER TABLE scheduling_events DROP CONSTRAINT IF EXISTS scheduling_events_event_type_check;
+ALTER TABLE scheduling_events ADD CONSTRAINT scheduling_events_event_type_check CHECK (event_type IN (
+    'submitted', 'started', 'preempted', 'completed', 'wait_reason',
+    'failed', 'triaged', 'retried', 'adjusted', 'escalated'
+));
 
 CREATE INDEX IF NOT EXISTS idx_scheduling_events_job_id ON scheduling_events (job_id);
 CREATE INDEX IF NOT EXISTS idx_scheduling_events_type ON scheduling_events (event_type);

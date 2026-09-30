@@ -15,12 +15,16 @@ import (
 )
 
 type Event struct {
-	Timestamp time.Time `json:"timestamp"`
-	JobID     string    `json:"job_id"`
-	EventType string    `json:"event_type"` // submitted, started, preempted, completed, wait_reason
-	NodeName  string    `json:"node_name,omitempty"`
-	Priority  int       `json:"priority"`
-	Detail    string    `json:"detail,omitempty"`
+	Timestamp    time.Time `json:"timestamp"`
+	JobID        string    `json:"job_id"`
+	EventType    string    `json:"event_type"`
+	NodeName     string    `json:"node_name,omitempty"`
+	Priority     int       `json:"priority"`
+	Model        string    `json:"model,omitempty"`
+	BatchSize    int       `json:"batch_size,omitempty"`
+	Attempt      int       `json:"attempt,omitempty"`
+	TriageAction string    `json:"triage_action,omitempty"`
+	Detail       string    `json:"detail,omitempty"`
 }
 
 type Recorder struct {
@@ -48,9 +52,11 @@ func (r *Recorder) Record(e Event) {
 
 	if r.db != nil {
 		_, err := r.db.Exec(
-			`INSERT INTO scheduling_events (timestamp, job_id, event_type, node_name, priority, detail)
-			 VALUES ($1, $2, $3, $4, $5, $6)`,
-			e.Timestamp, e.JobID, e.EventType, e.NodeName, e.Priority, e.Detail,
+			`INSERT INTO scheduling_events
+			 (timestamp, job_id, event_type, node_name, priority, model, batch_size, attempt, triage_action, detail)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			e.Timestamp, e.JobID, e.EventType, e.NodeName, e.Priority, e.Model,
+			e.BatchSize, e.Attempt, e.TriageAction, e.Detail,
 		)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "telemetry: postgres insert error: %v\n", err)

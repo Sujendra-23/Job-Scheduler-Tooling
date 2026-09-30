@@ -7,11 +7,20 @@ pipeline {
         }
 
         stage('Build') {
-            steps { sh 'go build ./...' }
+            steps { sh 'make build' }
         }
 
         stage('Unit Tests') {
             steps { sh 'go test ./internal/... -v -cover' }
+        }
+
+        stage('Distributed Inference + Failure Triage') {
+            steps {
+                sh '''
+                    ./bin/dispatcher -jobs 9 -workers 3 -backend cpu-reference \
+                        -failure-rate 0.5 -seed 42 -out distributed_events.jsonl
+                '''
+            }
         }
 
         stage('Memory Allocator Regression') {
@@ -41,7 +50,7 @@ pipeline {
 
     post {
         always {
-            archiveArtifacts artifacts: 'scheduling_events.jsonl,allocator_output.txt', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'scheduling_events.jsonl,distributed_events.jsonl,allocator_output.txt', allowEmptyArchive: true
         }
     }
 }

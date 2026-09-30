@@ -21,6 +21,7 @@ import (
 
 	_ "github.com/lib/pq"
 
+	"scheduler/internal/inference"
 	"scheduler/internal/queue"
 	"scheduler/internal/resource"
 	"scheduler/internal/telemetry"
@@ -66,7 +67,7 @@ type runningJob struct {
 }
 
 func main() {
-	numJobs := flag.Int("jobs", 40, "number of synthetic jobs to submit")
+	numJobs := flag.Int("jobs", 40, "number of inference batches to submit")
 	seed := flag.Int64("seed", 42, "random seed, for reproducible runs")
 	pgDSN := flag.String("pg-dsn", "", "Postgres DSN, e.g. postgres://user:pass@localhost/scheduler?sslmode=disable (optional)")
 	jsonlPath := flag.String("out", "scheduling_events.jsonl", "path to write the JSONL event log")
@@ -118,17 +119,28 @@ func main() {
 		arrivalTick int
 	}
 	var toSubmit []pendingSubmit
+	batchSizes := []int{1, 8, 16, 32}
 	for i := 0; i < *numJobs; i++ {
 		priority := 1 + rng.Intn(5) // 1 (low) to 5 (high)
+		batchSize := batchSizes[rng.Intn(len(batchSizes))]
+		precision := "fp32"
+		if rng.Intn(2) == 0 {
+			precision = "fp16"
+		}
+		batch, err := inference.NewResNet50Batch(batchSize, precision, *seed+int64(i))
+		if err != nil {
+			log.Fatalf("scheduler: creating inference batch: %v", err)
+		}
 		req := resource.Requirements{
-			CPUCores: 1 + rng.Intn(8),
-			MemoryMB: (1 + rng.Intn(8)) * 1024,
-			GPUs:     rng.Intn(3), // most jobs want 0-2 GPUs
+			CPUCores: 2 + rng.Intn(4),
+			MemoryMB: 2048 + batchSize*128,
+			GPUs:     1,
 		}
 		job := &queue.Job{
 			ID:        fmt.Sprintf("job-%03d", i),
 			Priority:  priority,
 			Resources: req,
+			Inference: batch,
 		}
 		toSubmit = append(toSubmit, pendingSubmit{job: job, arrivalTick: rng.Intn(30)})
 	}
@@ -144,7 +156,9 @@ func main() {
 				j.State = queue.Pending
 				q.Push(j)
 				rec.Record(telemetry.Event{Timestamp: now, JobID: j.ID, EventType: "submitted", Priority: j.Priority,
-					Detail: fmt.Sprintf("cpu=%d mem=%dMB gpu=%d", j.Resources.CPUCores, j.Resources.MemoryMB, j.Resources.GPUs)})
+					Model: j.Inference.Model, BatchSize: j.Inference.BatchSize,
+					Detail: fmt.Sprintf("model=%s batch=%d precision=%s cpu=%d mem=%dMB gpu=%d", j.Inference.Model,
+						j.Inference.BatchSize, j.Inference.Precision, j.Resources.CPUCores, j.Resources.MemoryMB, j.Resources.GPUs)})
 			}
 		}
 
@@ -158,7 +172,8 @@ func main() {
 					}
 				}
 				rj.job.State = queue.Completed
-				rec.Record(telemetry.Event{Timestamp: now, JobID: id, EventType: "completed", NodeName: rj.job.Node, Priority: rj.job.Priority})
+				rec.Record(telemetry.Event{Timestamp: now, JobID: id, EventType: "completed", NodeName: rj.job.Node,
+					Priority: rj.job.Priority, Model: rj.job.Inference.Model, BatchSize: rj.job.Inference.BatchSize})
 				delete(running, id)
 			}
 		}
@@ -203,10 +218,11 @@ func main() {
 			j.State = queue.Running
 			j.Node = node.Name
 			j.StartTime = now
-			duration := 5 + rng.Intn(20) // simulated job runtime, in ticks
+			duration := 4 + j.Inference.BatchSize/4 + rng.Intn(8) // estimated inference runtime, in ticks
 			running[j.ID] = &runningJob{job: j, finishTick: tick + duration}
 
 			rec.Record(telemetry.Event{Timestamp: now, JobID: j.ID, EventType: "started", NodeName: node.Name, Priority: j.Priority,
+				Model: j.Inference.Model, BatchSize: j.Inference.BatchSize,
 				Detail: fmt.Sprintf("waited %s", j.WaitTime(now))})
 		}
 		for _, j := range requeue {

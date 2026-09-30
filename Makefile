@@ -1,8 +1,16 @@
-.PHONY: build run-sim run-sim-pg trace allocator test clean
+.PHONY: build run-distributed run-sim run-sim-pg trace allocator test clean
 
 build:
 	go build -o bin/scheduler ./cmd/scheduler
+	go build -o bin/dispatcher ./cmd/dispatcher
 	go build -o bin/tracer ./cmd/tracer
+
+# Runs actual inference batch payloads through three separate local worker
+# processes. auto uses torchvision ResNet-50 when installed and otherwise the
+# dependency-free CPU reference model.
+run-distributed: build
+	./bin/dispatcher -jobs 12 -workers 3 -backend auto \
+		-failure-rate 0.25 -out scheduling_events.jsonl
 
 # Runs the simulation writing only to the local JSONL log (no Postgres
 # required).

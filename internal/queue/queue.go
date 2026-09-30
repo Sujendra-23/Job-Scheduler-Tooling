@@ -7,6 +7,7 @@ import (
 	"container/heap"
 	"time"
 
+	"scheduler/internal/inference"
 	"scheduler/internal/resource"
 )
 
@@ -35,13 +36,19 @@ func (s JobState) String() string {
 }
 
 type Job struct {
-	ID        string
-	Priority  int // higher = more important
-	Resources resource.Requirements
-	State     JobState
-	SubmitTime time.Time
-	StartTime  time.Time // zero until it starts running
-	Node       string    // which node it's running on, once placed
+	ID          string
+	Priority    int // higher = more important
+	Resources   resource.Requirements
+	Inference   inference.Batch
+	Attempt     int
+	MaxAttempts int
+	// InjectFailure is consumed by a worker on the first attempt. It makes
+	// failure handling reproducible instead of depending on flaky hardware.
+	InjectFailure string
+	State         JobState
+	SubmitTime    time.Time
+	StartTime     time.Time // zero until it starts running
+	Node          string    // which node it's running on, once placed
 
 	index int // heap bookkeeping, do not set directly
 }

@@ -9,3 +9,6 @@ mem/allocator
 allocator_output.txt
 Output1
 Output2
+.venv/
+__pycache__/
+*.py[cod]

@@ -1,13 +1,16 @@
-# System-Level Job Scheduler & Debugging Tooling
+# Distributed Inference Job Scheduler & Debugging Tooling
 
-A SLURM/LSF-inspired job scheduler with resource-aware placement and
-priority preemption, a free-list memory allocator simulator for studying
-fragmentation, and a tracing CLI that answers "why did job X wait" from
-structured event telemetry logged to both a JSONL file and PostgreSQL.
+A local distributed job-dispatch system for prioritized ML inference batches,
+with multiple OS worker processes, reproducible failure injection, agentic
+failure triage, structured telemetry, and a tracing CLI. The repository also
+retains its original SLURM/LSF-style resource-placement simulation and
+free-list memory allocator study.
 
 ## Requirements
 
 - Go 1.22+
+- Python 3.10+
+- PyTorch + torchvision (optional, for real ResNet-50; see `requirements-ml.txt`)
 - `gcc` (only for `make allocator`)
 - PostgreSQL (optional, only for `make run-sim-pg`)
 
@@ -15,18 +18,92 @@ structured event telemetry logged to both a JSONL file and PostgreSQL.
 
 ```
 cmd/scheduler/       simulation: job arrivals, placement, preemption, completion
+cmd/dispatcher/      coordinator + separately spawned inference worker process
 cmd/tracer/           debugging CLI: per-job timeline + aggregate wait-time stats
+ml/                   persistent ResNet-50 / CPU-reference inference runner
+internal/dispatch/    synchronized priority broker and job lifecycle
+internal/inference/   typed ResNet-50 batch and result contracts
 internal/resource/    node capacity model + best-fit placement
 internal/queue/        priority heap with FIFO-within-tier ordering
 internal/telemetry/    structured event logging (JSONL + Postgres sink)
+internal/triage/      LLM and deterministic fallback triage agents
 mem/allocator.c        free-list allocator with fragmentation tracking
 sql/schema.sql         Postgres schema + analytics queries (joins/aggregations)
 Jenkinsfile            CI: build, unit tests, allocator regression gate, sim run
 ```
 
-## How the scheduler works
+## Distributed inference path
 
-Jobs arrive with a random priority (1-5) and CPU/memory/GPU requirements.
+`dispatcher` creates actual inference payloads using the same contract as the
+sibling GPU Benchmarking Suite: `torchvision.models.resnet50`, NCHW
+`[batch, 3, 224, 224]` inputs, and fp32/fp16 precision. Each long-lived worker
+loads its model once, repeatedly pulls the highest-priority available batch
+from the coordinator's shared queue, runs a forward pass, and reports latency
+and top-1 class IDs.
+
+Workers are separate OS processes communicating with the coordinator over TCP
+RPC. This is a genuine process boundary and shared work queue, but it is
+intentionally documented as a **single-host simulation of distribution**. The
+RPC worker subcommand can also be launched on another host if the coordinator
+listener is made externally reachable; authentication/TLS are not included.
+
+When `torch`/`torchvision` are installed, `-backend auto` runs ResNet-50 on
+CUDA when present or CPU otherwise. On a machine without those packages it
+falls back to a dependency-free two-layer CPU reference model. That fallback
+performs a real neural-network forward pass for CI, but is not represented as
+ResNet-50 performance; every completion event records its actual backend.
+
+### Run it
+
+```bash
+make run-distributed
+
+# Deterministic CI/demo run; all first attempts fail, exercising every action.
+./bin/dispatcher -jobs 6 -workers 3 -backend cpu-reference \
+  -failure-rate 1 -seed 7 -out /tmp/distributed.jsonl
+```
+
+The second command produces OOM, transient reset, and corrupt-input failures.
+The triage layer respectively auto-adjusts the batch, retries it, or escalates
+it. Injection is consumed after the first attempt so retries test recovery
+instead of creating an infinite artificial failure loop.
+
+| Flag | Meaning |
+|---|---|
+| `-workers` | number of separately spawned worker processes |
+| `-backend` | `auto`, `torch`, or dependency-free `cpu-reference` |
+| `-failure-rate` | fraction of first attempts receiving deterministic failure injection |
+| `-triage-mode` | `policy` (offline/reproducible) or `llm` |
+| `-triage-url` | OpenAI-compatible chat-completions endpoint |
+| `-triage-model` | model name served by that endpoint |
+| `-triage-api-key` | API key; prefer `TRIAGE_LLM_API_KEY` instead |
+
+### Agentic failure triage
+
+LLM mode sends the failed batch shape, precision, attempt count, retry budget,
+and error to a model. The model must choose exactly one tool-like action:
+`retry`, `auto_adjust`, or `escalate`. Decisions are schema-validated, and the
+coordinator independently prevents the model from exceeding the retry budget.
+If the model endpoint is unavailable or returns invalid output, an explicit
+`policy_fallback` decision is recorded rather than losing the job.
+
+```bash
+export TRIAGE_LLM_URL=http://localhost:8000/v1/chat/completions
+export TRIAGE_LLM_MODEL=my-instruct-model
+export TRIAGE_LLM_API_KEY=...
+
+./bin/dispatcher -jobs 12 -workers 3 -triage-mode llm
+```
+
+Telemetry now covers `failed`, `triaged`, `retried`, `adjusted`, and
+`escalated` in addition to the original lifecycle events. Each record includes
+model, batch size, attempt, worker ID, and triage action. The Postgres schema
+contains idempotent migration statements for these fields.
+
+## Original scheduler simulation
+
+ResNet-50 inference batches arrive with a random priority (1-5), batch size,
+precision, and derived CPU/memory/GPU requirements.
 Each simulation tick: newly-arrived jobs are submitted, finished jobs
 release their resources, then pending jobs are placed highest-priority
 first using best-fit-by-CPU-slack. If a high-priority job can't be placed,
@@ -39,6 +116,7 @@ is told to keep waiting - is written as a structured event.
 
 ```bash
 make build
+make run-distributed      # multi-process inference dispatch
 make run-sim              # writes scheduling_events.jsonl, no DB needed
 make trace                 # prints aggregate wait-time stats
 
@@ -67,7 +145,7 @@ workload (that's where you supply input), `tracer` reads the log
 
 | Flag | Meaning |
 |---|---|
-| `-jobs` | how many synthetic jobs to generate (default 40) |
+| `-jobs` | how many inference-batch jobs to generate (default 40) |
 | `-seed` | random seed - same seed + same `-jobs` always reproduces the exact same run |
 | `-out` | where to write the JSONL event log |
 | `-max-ticks` | how many simulated ticks to run before stopping (default 200) |
@@ -164,6 +242,9 @@ What's covered:
 | Package | Tested |
 |---|---|
 | `internal/queue` | priority ordering, FIFO-within-tier, empty pop, peek |
+| `internal/inference` | ResNet-50 batch construction and validation |
+| `internal/dispatch` | cross-worker claims, priority ordering, adjustment/requeue, completion |
+| `internal/triage` | retry/adjust/escalate policy, retry limits, mocked LLM response parsing |
 | `internal/resource` | fit/reserve/release, best-fit slack selection, no-fit case |
 | `internal/telemetry` | event recorder creates/writes the JSONL file, nil-DB safety, bad-path error |
 | `cmd/tracer` | log parsing (incl. malformed lines), job timeline reporting, summary stats |
@@ -175,10 +256,19 @@ and `make allocator`), not by unit tests.
 
 ## Known limitations
 
-- The cluster topology and simulation length are now flags (`-nodes`,
-  `-max-ticks`), but the simulation loop itself is single-threaded and
-  tick-based - it models the scheduling *algorithm*, not the concurrency
-  or networking a real scheduler daemon would need.
+- Distributed workers currently run on one host by default. TCP RPC creates
+  real process/network boundaries, but the coordinator has no TLS, worker
+  identity, replicated queue, or failover and is not production cluster
+  infrastructure.
+- The original `cmd/scheduler` resource/preemption study remains a
+  single-threaded tick simulation. The new `cmd/dispatcher` is the executable
+  that performs concurrent multi-process inference work.
+- ResNet-50 uses `weights=None`, exactly like GPU Suite's benchmark harness,
+  so it benchmarks/executes the model graph but its class IDs are not useful
+  predictions until a trained checkpoint is supplied.
+- The offline triage policy exists for reproducible local/CI runs. Use
+  `-triage-mode llm` to exercise an actual language-model decision; its
+  fallback source remains visible in telemetry.
 - A preempted job's wait clock restarts on requeue
   (`cmd/scheduler/main.go`, where the job is pushed back onto the queue),
   a deliberate simplification - the priority-vs-wait numbers above measure
