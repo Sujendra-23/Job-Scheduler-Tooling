@@ -24,6 +24,7 @@ type Event struct {
 	BatchSize    int       `json:"batch_size,omitempty"`
 	Attempt      int       `json:"attempt,omitempty"`
 	TriageAction string    `json:"triage_action,omitempty"`
+	Version      int64     `json:"version,omitempty"` // device config version (device registry events)
 	Detail       string    `json:"detail,omitempty"`
 }
 

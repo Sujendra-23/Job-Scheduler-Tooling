@@ -44,7 +44,9 @@ virtual environment is not activated or PyTorch cannot be imported,
 ```
 cmd/scheduler/       simulation: job arrivals, placement, preemption, completion
 cmd/dispatcher/      coordinator + separately spawned inference worker process
-cmd/tracer/           debugging CLI: per-job timeline + aggregate wait-time stats
+cmd/tracer/           debugging CLI: per-job timeline, wait-time stats, device config status
+cmd/devices/          device registry simulation: versioned config push with ack/retry + HTTP status
+internal/devices/     registry, simulated lossy network + device workers
 ml/                   persistent ResNet-50 / CPU-reference inference runner
 internal/dispatch/    synchronized priority broker and job lifecycle; SQS-backed coordinator + worker loop
 internal/sqsqueue/    SQS queue-per-priority-tier + DLQ wrapper (LocalStack-tested)
@@ -201,6 +203,48 @@ would be redelivered while still running (and then deduplicated by the
 coordinator). Workers still call a single-host coordinator over RPC for
 telemetry/triage; only the queue itself moved to SQS.
 
+## Device registry with versioned config push (single-host simulation)
+
+`internal/devices` + `cmd/devices` model the delivery logic of pushing
+versioned configuration to a fleet of device workers. **This is a single-host
+simulation**: the devices are in-process structs behind a lossy in-memory
+"network" with seeded fault injection. There is no real device protocol, no
+real network, and the registry state is in-memory (a registry restart resets
+versions).
+
+- Each device has its own monotonically increasing **config version**
+  (`SetConfig` bumps it).
+- A push waits up to `-ack-timeout` for an **ack**; on timeout it retries with
+  exponential backoff, **bounded** by `-max-attempts`, after which the device is
+  marked `failed` (an operator can `POST /devices/{id}/retry`).
+- **Devices ignore stale or duplicate versions**: a push with version <= the one
+  the device runs is not applied, but the device still acks the version it runs,
+  so a lost ack is recovered by retrying and a re-delivery applies exactly once.
+- The registry ignores acks whose version is not the desired one, and a newer
+  `SetConfig` **supersedes** an older push still being retried.
+- **Status** is visible via HTTP and via the tracing CLI (events are written as
+  telemetry with job id `device:<id>`).
+
+```bash
+make build
+./bin/devices -demo -devices 6 -drop-ack-rate 0.4 -drop-push-rate 0.2 -out devices.jsonl
+./bin/tracer -log devices.jsonl -devices            # per-device desired/acked/state/attempts table
+./bin/tracer -log devices.jsonl -job device:cam-01  # full push/timeout/ack timeline
+
+./bin/devices -addr :8190 -devices 3 -drop-ack-rate 0.5 &   # serve mode
+curl -X PUT -d '{"fps":"30"}' localhost:8190/devices/cam-01/config   # -> {"version":1}
+curl localhost:8190/devices                                           # all statuses (JSON)
+curl localhost:8190/devices/cam-01                                    # one device
+```
+
+Tests (`go test ./internal/devices/ ./cmd/tracer/`, also run with `-race`):
+ack marks the version delivered; **retry after a dropped ack** (device applied
+once, received twice); retry after dropped pushes; retry bounded then `failed`
+(and recovers via `Retry`); **idempotent re-delivery** and stale-version
+rejection on the device; a stale ack never completes the desired version; a
+newer config supersedes an in-flight push; independent per-device versions;
+the HTTP endpoints; and the tracer's per-device status table.
+
 ## Original scheduler simulation
 
 ResNet-50 inference batches arrive with a random priority (1-5), batch size,
@@ -349,7 +393,8 @@ What's covered:
 | `internal/triage` | retry/adjust/escalate policy, retry limits, mocked LLM response parsing |
 | `internal/resource` | fit/reserve/release, best-fit slack selection, no-fit case |
 | `internal/telemetry` | event recorder creates/writes the JSONL file, nil-DB safety, bad-path error |
-| `cmd/tracer` | log parsing (incl. malformed lines), job timeline reporting, summary stats |
+| `internal/devices` | config push ack, retry on dropped ack/push, bounded retry -> failed, idempotent re-delivery, stale ack/version handling, supersede, HTTP API |
+| `cmd/tracer` | log parsing (incl. malformed lines), job timeline reporting, summary stats, device status table |
 | `cmd/scheduler` | `-nodes` spec parsing (valid, default, malformed) |
 
 `cmd/scheduler`'s `main` itself (flag wiring, DB connection) and

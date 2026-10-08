@@ -143,3 +143,35 @@ func TestSummaryNoCompletedStarts(t *testing.T) {
 		t.Errorf("expected 'no completed start events' message, got:\n%s", out)
 	}
 }
+
+func TestDeviceStatusFromEvents(t *testing.T) {
+	base := time.Now()
+	at := func(i int) time.Time { return base.Add(time.Duration(i) * time.Millisecond) }
+	events := []Event{
+		{Timestamp: at(0), JobID: "device:a", EventType: "config_set", Version: 1},
+		{Timestamp: at(1), JobID: "device:a", EventType: "push", Version: 1, Attempt: 1},
+		{Timestamp: at(2), JobID: "device:a", EventType: "ack_timeout", Version: 1, Attempt: 1},
+		{Timestamp: at(3), JobID: "device:a", EventType: "push", Version: 1, Attempt: 2},
+		{Timestamp: at(4), JobID: "device:a", EventType: "duplicate_ignored_by_device", Version: 1, Attempt: 2},
+		{Timestamp: at(5), JobID: "device:a", EventType: "acked", Version: 1, Attempt: 2},
+		{Timestamp: at(6), JobID: "device:b", EventType: "config_set", Version: 1},
+		{Timestamp: at(7), JobID: "device:b", EventType: "push", Version: 1, Attempt: 1},
+		{Timestamp: at(8), JobID: "device:b", EventType: "push_failed", Version: 1, Attempt: 1},
+		{Timestamp: at(9), JobID: "device:c", EventType: "config_set", Version: 2},
+		{Timestamp: at(10), JobID: "job-001", EventType: "submitted"}, // not a device event
+	}
+	rows := deviceStatus(events)
+	if len(rows) != 3 {
+		t.Fatalf("rows = %d", len(rows))
+	}
+	a, b, c := rows[0], rows[1], rows[2]
+	if a.state() != "acked" || a.attempts != 2 || a.timeouts != 1 || a.dupIgnored != 1 {
+		t.Fatalf("a = %+v", a)
+	}
+	if b.state() != "failed" {
+		t.Fatalf("b = %+v", b)
+	}
+	if c.state() != "pending" || c.desired != 2 {
+		t.Fatalf("c = %+v", c)
+	}
+}

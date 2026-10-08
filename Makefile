@@ -4,6 +4,7 @@ build:
 	go build -o bin/scheduler ./cmd/scheduler
 	go build -o bin/dispatcher ./cmd/dispatcher
 	go build -o bin/tracer ./cmd/tracer
+	go build -o bin/devices ./cmd/devices
 
 # Runs actual inference batch payloads through three separate local worker
 # processes. auto uses torchvision ResNet-50 when installed and otherwise the
