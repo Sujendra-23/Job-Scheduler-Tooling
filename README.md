@@ -46,7 +46,8 @@ cmd/scheduler/       simulation: job arrivals, placement, preemption, completion
 cmd/dispatcher/      coordinator + separately spawned inference worker process
 cmd/tracer/           debugging CLI: per-job timeline + aggregate wait-time stats
 ml/                   persistent ResNet-50 / CPU-reference inference runner
-internal/dispatch/    synchronized priority broker and job lifecycle
+internal/dispatch/    synchronized priority broker and job lifecycle; SQS-backed coordinator + worker loop
+internal/sqsqueue/    SQS queue-per-priority-tier + DLQ wrapper (LocalStack-tested)
 internal/inference/   typed ResNet-50 batch and result contracts
 internal/resource/    node capacity model + best-fit placement
 internal/queue/        priority heap with FIFO-within-tier ordering
@@ -141,6 +142,64 @@ by a worker process, completed successfully, and recorded:
 
 This is a measured local result, not a projected GPU benchmark. Hardware,
 backend, model warm-up, and batch size materially affect latency.
+
+## SQS-backed queue (optional, LocalStack-verified)
+
+`dispatcher -queue-backend sqs` swaps the in-process priority heap for Amazon
+SQS. The default (`-queue-backend broker`) is unchanged.
+
+- **One queue per priority tier**: `<prefix>-p1` ... `<prefix>-p5`. Workers
+  sweep tiers highest-first (`internal/sqsqueue`), so priority is strict across
+  tiers and FIFO-ish within a tier (standard queues give best-effort ordering).
+- **Visibility timeout** (`-sqs-visibility-timeout`, default 30s): a received
+  batch is hidden from other workers; the worker acks (deletes) it only after
+  the result is reported. If the worker dies mid-job the message simply
+  reappears after the timeout and another worker takes it.
+- **Dead-letter queue** `<prefix>-dlq` with `maxReceiveCount`
+  (`-sqs-max-receive`, default 3) on every tier queue: a batch that keeps
+  killing workers is moved to the DLQ instead of looping forever. The
+  coordinator watches the DLQ and records a terminal `dead_lettered` event.
+- Triage still applies: `retry` = release the message for immediate redelivery,
+  `auto_adjust` = enqueue the adjusted batch and ack the old one, `escalate` =
+  ack and record. Delivery is **at-least-once**, so completion is idempotent:
+  a batch redelivered after it was already reported complete is acked and
+  logged as `duplicate_delivery`, never double-counted.
+- New telemetry events (visible with `tracer -job <id>`): `redelivered`
+  (previous holder never acked), `dead_lettered`, `duplicate_delivery`.
+
+```bash
+docker run -d --rm --name localstack-sqs -p 4566:4566 -e SERVICES=sqs localstack/localstack:3.8
+export SQS_ENDPOINT=http://localhost:4566
+make build
+./scripts/sqs-redelivery-demo.sh                  # kill-a-worker demo (below)
+go test ./... -v                                  # SQS integration tests run when SQS_ENDPOINT is set, skip otherwise
+./bin/dispatcher -queue-backend sqs -jobs 12 -workers 3 -backend cpu-reference
+```
+
+`-chaos-poison N` / `-chaos-hang N` make the dispatcher SIGKILL the worker
+process that receives those jobs (and start a replacement), which is how the
+demo proves recovery with real process deaths rather than a mocked failure.
+
+Abbreviated output of `scripts/sqs-redelivery-demo.sh` (visibility timeout 4s,
+max receive 3, 8 jobs, 3 workers; SIGKILLs are real `kill -9`s of worker
+processes):
+
+```
+chaos: SIGKILL worker-01 while it held inference-000 (receive_count=1)
+chaos: SIGKILL worker-06 while it held inference-000 (receive_count=2)
+chaos: SIGKILL worker-04 while it held inference-000 (receive_count=3)
+worker processes spawned=8 submitted=8 succeeded=7 escalated=0 dead_lettered=1 retried=0 adjusted=2 redelivered=4 duplicates=0
+inference-000: started x3 (each holder killed) -> dead_lettered
+inference-001: started (worker killed) -> redelivered after the visibility timeout -> started on another worker -> completed
+```
+
+Caveats: tested against **LocalStack 3.8 only**, not real AWS SQS (real SQS
+short-polling can return empty on a non-empty queue and visibility expiry is
+not instantaneous; the worker loop just re-polls). There is no visibility
+heartbeat, so a job that legitimately runs longer than the visibility timeout
+would be redelivered while still running (and then deduplicated by the
+coordinator). Workers still call a single-host coordinator over RPC for
+telemetry/triage; only the queue itself moved to SQS.
 
 ## Original scheduler simulation
 
@@ -285,7 +344,8 @@ What's covered:
 |---|---|
 | `internal/queue` | priority ordering, FIFO-within-tier, empty pop, peek |
 | `internal/inference` | ResNet-50 batch construction and validation |
-| `internal/dispatch` | cross-worker claims, priority ordering, adjustment/requeue, completion |
+| `internal/dispatch` | cross-worker claims, priority ordering, adjustment/requeue, completion; SQS coordinator idempotency, killed-worker redelivery, poison-job DLQ (SQS tests need LocalStack) |
+| `internal/sqsqueue` | tier priority order, visibility-timeout redelivery, DLQ after maxReceiveCount, immediate release (needs LocalStack) |
 | `internal/triage` | retry/adjust/escalate policy, retry limits, mocked LLM response parsing |
 | `internal/resource` | fit/reserve/release, best-fit slack selection, no-fit case |
 | `internal/telemetry` | event recorder creates/writes the JSONL file, nil-DB safety, bad-path error |

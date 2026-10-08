@@ -27,6 +27,7 @@ import (
 	"scheduler/internal/inference"
 	"scheduler/internal/queue"
 	"scheduler/internal/resource"
+	"scheduler/internal/sqsqueue"
 	"scheduler/internal/telemetry"
 	"scheduler/internal/triage"
 )
@@ -100,11 +101,19 @@ func runWorker(args []string) error {
 	python := fs.String("python", "python3", "Python interpreter")
 	runnerScript := fs.String("runner", "ml/inference_runner.py", "inference runner path")
 	backend := fs.String("backend", "auto", "auto, torch, or cpu-reference")
+	queueBackend := fs.String("queue-backend", "broker", "broker (in-process priority queue) or sqs")
+	sqsEndpoint := fs.String("sqs-endpoint", os.Getenv("SQS_ENDPOINT"), "SQS endpoint override (LocalStack)")
+	sqsRegion := fs.String("sqs-region", "us-east-1", "SQS region")
+	sqsPrefix := fs.String("sqs-prefix", "sched", "SQS queue name prefix")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *brokerAddress == "" || *workerID == "" {
 		return errors.New("worker requires -broker and -worker-id")
+	}
+	if *queueBackend == "sqs" {
+		return runSQSWorker(*brokerAddress, *workerID, *python, *runnerScript, *backend,
+			sqsqueue.Config{Endpoint: *sqsEndpoint, Region: *sqsRegion, Prefix: *sqsPrefix})
 	}
 
 	client, err := rpc.Dial("tcp", *brokerAddress)
@@ -182,6 +191,15 @@ func runCoordinator(args []string) error {
 	triageModel := fs.String("triage-model", os.Getenv("TRIAGE_LLM_MODEL"), "LLM model name")
 	triageKey := fs.String("triage-api-key", os.Getenv("TRIAGE_LLM_API_KEY"), "LLM API key (prefer environment variable)")
 	pgDSN := fs.String("pg-dsn", "", "optional Postgres DSN")
+	queueBackend := fs.String("queue-backend", "broker", "job queue: broker (in-process priority heap, default) or sqs (SQS queue per priority tier + DLQ)")
+	sqsEndpoint := fs.String("sqs-endpoint", os.Getenv("SQS_ENDPOINT"), "SQS endpoint override, e.g. http://localhost:4566 for LocalStack; empty = real AWS")
+	sqsRegion := fs.String("sqs-region", "us-east-1", "SQS region")
+	sqsPrefix := fs.String("sqs-prefix", "sched", "SQS queue name prefix (<prefix>-p1..p5, <prefix>-dlq)")
+	sqsVisibility := fs.Int("sqs-visibility-timeout", 30, "seconds a received batch stays hidden before redelivery if not acked")
+	sqsMaxReceive := fs.Int("sqs-max-receive", 3, "deliveries before a batch is moved to the dead-letter queue")
+	sqsKeep := fs.Bool("sqs-keep-queues", false, "do not delete the SQS queues on exit")
+	chaosHang := fs.Int("chaos-hang", 0, "sqs only: this many jobs make their first worker stall and get SIGKILLed (redelivery demo)")
+	chaosPoison := fs.Int("chaos-poison", 0, "sqs only: this many jobs kill every worker that receives them (DLQ demo)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -215,6 +233,20 @@ func runCoordinator(args []string) error {
 		return err
 	}
 	defer recorder.Close()
+	if *queueBackend == "sqs" {
+		return runSQSCoordinator(sqsCoordinatorOpts{
+			jobs: *numJobs, workers: *numWorkers, seed: *seed, failureRate: *failureRate,
+			backend: *backend, python: *python, runner: *runnerScript, out: *out,
+			agent: agent, recorder: recorder, chaosHang: *chaosHang, chaosPoison: *chaosPoison, keepQueues: *sqsKeep,
+			sqs: sqsqueue.Config{
+				Endpoint: *sqsEndpoint, Region: *sqsRegion, Prefix: *sqsPrefix,
+				VisibilityTimeout: time.Duration(*sqsVisibility) * time.Second, MaxReceiveCount: *sqsMaxReceive,
+			},
+		})
+	}
+	if *queueBackend != "broker" {
+		return fmt.Errorf("unknown -queue-backend %q (want broker or sqs)", *queueBackend)
+	}
 	broker := dispatch.NewBroker(agent, recorder)
 
 	rpcServer := rpc.NewServer()
@@ -236,30 +268,11 @@ func runCoordinator(args []string) error {
 		}
 	}()
 
-	rng := rand.New(rand.NewSource(*seed))
-	batchSizes := []int{1, 8, 16, 32}
-	failureKinds := []string{"oom", "transient", "corrupt_input"}
-	baseTime := time.Now()
-	for i := 0; i < *numJobs; i++ {
-		batchSize := batchSizes[rng.Intn(len(batchSizes))]
-		precision := "fp32"
-		if rng.Intn(2) == 0 {
-			precision = "fp16"
-		}
-		batch, batchErr := inference.NewResNet50Batch(batchSize, precision, *seed+int64(i))
-		if batchErr != nil {
-			return batchErr
-		}
-		failure := ""
-		if rng.Float64() < *failureRate {
-			failure = failureKinds[i%len(failureKinds)]
-		}
-		job := &queue.Job{
-			ID: fmt.Sprintf("inference-%03d", i), Priority: 1 + rng.Intn(5),
-			Resources: resource.Requirements{CPUCores: 2, MemoryMB: 1024 + batchSize*64, GPUs: 1},
-			Inference: batch, MaxAttempts: 3, InjectFailure: failure,
-			SubmitTime: baseTime.Add(time.Duration(i) * time.Nanosecond),
-		}
+	jobs, err := generateJobs(*numJobs, *seed, *failureRate)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
 		if err := broker.Submit(job); err != nil {
 			return err
 		}
@@ -343,6 +356,39 @@ drainWorkers:
 		*numWorkers, stats.Submitted, stats.Succeeded, stats.Escalated, stats.Retried, stats.Adjusted)
 	fmt.Printf("event log written to %s\n", *out)
 	return nil
+}
+
+// generateJobs builds the deterministic synthetic workload shared by both
+// queue backends.
+func generateJobs(numJobs int, seed int64, failureRate float64) ([]*queue.Job, error) {
+	var jobs []*queue.Job
+	rng := rand.New(rand.NewSource(seed))
+	batchSizes := []int{1, 8, 16, 32}
+	failureKinds := []string{"oom", "transient", "corrupt_input"}
+	baseTime := time.Now()
+	for i := 0; i < numJobs; i++ {
+		batchSize := batchSizes[rng.Intn(len(batchSizes))]
+		precision := "fp32"
+		if rng.Intn(2) == 0 {
+			precision = "fp16"
+		}
+		batch, batchErr := inference.NewResNet50Batch(batchSize, precision, seed+int64(i))
+		if batchErr != nil {
+			return nil, batchErr
+		}
+		failure := ""
+		if rng.Float64() < failureRate {
+			failure = failureKinds[i%len(failureKinds)]
+		}
+		job := &queue.Job{
+			ID: fmt.Sprintf("inference-%03d", i), Priority: 1 + rng.Intn(5),
+			Resources: resource.Requirements{CPUCores: 2, MemoryMB: 1024 + batchSize*64, GPUs: 1},
+			Inference: batch, MaxAttempts: 3, InjectFailure: failure,
+			SubmitTime: baseTime.Add(time.Duration(i) * time.Nanosecond),
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
 }
 
 func main() {
