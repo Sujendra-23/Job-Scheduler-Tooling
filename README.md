@@ -46,7 +46,9 @@ cmd/scheduler/       simulation: job arrivals, placement, preemption, completion
 cmd/dispatcher/      coordinator + separately spawned inference worker process
 cmd/tracer/           debugging CLI: per-job timeline, wait-time stats, device config status
 cmd/devices/          device registry simulation: versioned config push with ack/retry + HTTP status
+cmd/technicians/      technician dispatch simulation: skills + travel time, reassignment, dead-letter
 internal/devices/     registry, simulated lossy network + device workers
+internal/technician/  skill + travel-time dispatcher, OSRM/haversine routing clients
 ml/                   persistent ResNet-50 / CPU-reference inference runner
 internal/dispatch/    synchronized priority broker and job lifecycle; SQS-backed coordinator + worker loop
 internal/sqsqueue/    SQS queue-per-priority-tier + DLQ wrapper (LocalStack-tested)
@@ -245,6 +247,48 @@ rejection on the device; a stale ack never completes the desired version; a
 newer config supersedes an in-flight push; independent per-device versions;
 the HTTP endpoints; and the tracer's per-device status table.
 
+## Technician dispatch (single-process simulation)
+
+`internal/technician` + `cmd/technicians` assign field work orders to technicians. It is a
+separate entry point (like `cmd/devices`), so the ML inference dispatcher and the SQS path are
+untouched.
+
+* **Skill match is a hard filter**: a technician must have every skill the order needs.
+* **Travel time picks among the qualified**: each candidate's ETA is "when they finish what is
+  already planned, plus the drive to this job", so a nearby technician with a full route loses
+  to a slightly farther idle one. Orders are inserted into a route by priority (FIFO within a
+  tier); this is a greedy assignment, not a full vehicle-routing optimizer.
+* **Routing** goes through a `Router` interface. `OSRMRouter` calls OSRM's Table service (the
+  same OSRM the `ai_maps` project uses for route geometry); `HaversineRouter` is a no-network
+  estimate (straight line x 1.3 at 40 km/h); `FallbackRouter` uses the second when the first
+  errors, and every assignment records which one produced its ETA (`osrm`, `haversine`,
+  `haversine-fallback`). Tests use fake routers and `httptest`, so they need no network.
+* **Events that change the plan**: `Cancel` and `RunningLate` trigger a rebalance that
+  reconsiders every planned (not started) job and moves it only if another technician arrives at
+  least 5 minutes sooner (`Options.MinImprovement`), so near-ties do not ping-pong.
+  `ReportFailure` retries on a different technician.
+* **Idempotency and dead letters follow the SQS coordinator's rules**: completing, cancelling or
+  failing a job that is already terminal (`completed`, `cancelled`, `dead_lettered`) is a counted
+  no-op (`duplicate_completion` event), and an order is dead-lettered after `MaxAttempts`
+  failures or after `MaxAttempts` passes with no qualified technician in the fleet. Waiting
+  because qualified technicians are merely full does not count toward dead-lettering. These are
+  in-memory states, not SQS messages; this mode does not use SQS.
+* Events go to the same telemetry recorder, so `tracer -log technicians.jsonl -job WO-104` works.
+
+```bash
+make run-technicians                    # haversine estimates, scripted day with a cancel, a late
+                                        # report, a failure, a dead letter and a duplicate completion
+OSRM_URL=http://localhost:5000 make run-technicians   # OSRM travel times (haversine if it is down)
+```
+
+**What was and was not run.** All tests are offline (`go test ./...`, also `-race`).
+OSRM was exercised by hand against the *public demo server* for one live table request and one
+run of the scenario (one request timed out and correctly fell back to haversine); that is a smoke
+test of the request/response shape, not a load or accuracy check, and the demo server is
+rate-limited and not for production use. Nothing was run against a self-hosted OSRM. The
+dispatcher holds its lock while calling the router (bounded by a 3 s HTTP timeout), state is
+in memory and lost on restart, and there are no time windows, shift hours or real-time traffic.
+
 ## Original scheduler simulation
 
 ResNet-50 inference batches arrive with a random priority (1-5), batch size,
@@ -394,6 +438,7 @@ What's covered:
 | `internal/resource` | fit/reserve/release, best-fit slack selection, no-fit case |
 | `internal/telemetry` | event recorder creates/writes the JSONL file, nil-DB safety, bad-path error |
 | `internal/devices` | config push ack, retry on dropped ack/push, bounded retry -> failed, idempotent re-delivery, stale ack/version handling, supersede, HTTP API |
+| `internal/technician` | skill filtering, ETA = queue + drive, priority insertion, capacity, cancel/running-late rebalancing with hysteresis, idempotent completion/cancel/failure, retry then dead-letter, no-qualified dead-letter, routing fallback, leg cache, OSRM request/response/errors (`httptest`), concurrency (`-race`); `TestOSRMLive` runs only if `OSRM_URL` is set |
 | `cmd/tracer` | log parsing (incl. malformed lines), job timeline reporting, summary stats, device status table |
 | `cmd/scheduler` | `-nodes` spec parsing (valid, default, malformed) |
 
