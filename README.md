@@ -50,6 +50,7 @@ internal/devices/     registry, simulated lossy network + device workers
 ml/                   persistent ResNet-50 / CPU-reference inference runner
 internal/dispatch/    synchronized priority broker and job lifecycle; SQS-backed coordinator + worker loop
 internal/sqsqueue/    SQS queue-per-priority-tier + DLQ wrapper (LocalStack-tested)
+internal/sandbox/     Docker sandbox for untrusted jobs: limits, no network, read-only fs, timeout, failure classes
 internal/inference/   typed ResNet-50 batch and result contracts
 internal/resource/    node capacity model + best-fit placement
 internal/queue/        priority heap with FIFO-within-tier ordering
@@ -202,6 +203,51 @@ heartbeat, so a job that legitimately runs longer than the visibility timeout
 would be redelivered while still running (and then deduplicated by the
 coordinator). Workers still call a single-host coordinator over RPC for
 telemetry/triage; only the queue itself moved to SQS.
+
+## Sandboxed execution of untrusted jobs (Docker, SQS backend)
+
+A job that carries a `Sandbox` spec (`image`, `cmd`, `cpus`, `memory_mb`, `timeout_s`, optional `stdin`/`env`/`pids_limit`)
+never runs on the worker's host. `internal/sandbox` runs it in a throwaway Docker container created with:
+
+| Boundary | Flag |
+|---|---|
+| no network | `--network none` |
+| read-only root filesystem | `--read-only` (plus a 64 MB `noexec` tmpfs at `/tmp`) |
+| no capabilities, no escalation | `--cap-drop ALL --security-opt no-new-privileges`, user `65534:65534` |
+| CPU / memory | `--cpus N --memory Xm --memory-swap Xm` (no swap) |
+| fork bombs | `--pids-limit` (default 128) |
+| wall clock | enforced outside the container; on expiry the container is `docker kill`ed and removed |
+
+Before starting, the runner `docker inspect`s the container and **refuses to run** if any of those settings is not in
+effect. Every run ends in one class; anything but `ok` is sent to the existing dead-letter queue with that class and a
+detail (exit status, stderr tail) as message attributes, then the original message is acked (DLQ first, so a crash in
+between redelivers the job instead of losing it). The coordinator records them as `dead_lettered` events:
+
+| Class | Meaning |
+|---|---|
+| `non_zero_exit` | the job exited non-zero |
+| `timeout` | exceeded `timeout_s` |
+| `oom_killed` | hit the memory limit (Docker `OOMKilled`) |
+| `sandbox_violation` | the job *tried* to cross a boundary: write to the read-only fs, use the network, a privileged operation, a blocked syscall |
+| `sandbox_unavailable` / `invalid_sandbox_spec` | the worker has no sandbox runner (the job is dead-lettered, never run unsandboxed) / the spec failed validation |
+
+If Docker itself is unreachable, or hardening is not applied, the job was never judged: it is released for another worker
+and the worker exits, instead of dead-lettering jobs for an outage.
+
+```bash
+docker run -d --rm --name localstack-sqs -p 4566:4566 -e SERVICES=sqs localstack/localstack:3.8
+export SQS_ENDPOINT=http://localhost:4566
+make build
+# first 6 jobs become sandboxed jobs: ok, exit 3, timeout, OOM kill, network attempt, read-only-fs write
+./bin/dispatcher -queue-backend sqs -jobs 8 -workers 2 -backend cpu-reference -sandbox-demo 6 -failure-rate 0
+```
+
+Caveats, stated plainly: this is Docker's container isolation, not a VM; a kernel or runtime escape is out of scope.
+`sandbox_violation` is detected from stderr signatures and `SIGSYS` exits, so it labels attempts heuristically, while
+the flags above are what actually contain them. Sandboxed jobs report exit status and duration only; stdout is kept
+in the worker log, not in telemetry. The in-process `broker` backend has no DLQ and refuses sandboxed jobs. A worker
+SIGKILLed mid-job leaves its container running until the next worker's start-up sweep removes it. Tested on Docker 29.8
+(Docker Desktop, Linux VM) with `alpine:3.20` and LocalStack 3.8, not on Linux hosts or rootless Docker.
 
 ## Device registry with versioned config push (single-host simulation)
 
@@ -388,7 +434,8 @@ What's covered:
 |---|---|
 | `internal/queue` | priority ordering, FIFO-within-tier, empty pop, peek |
 | `internal/inference` | ResNet-50 batch construction and validation |
-| `internal/dispatch` | cross-worker claims, priority ordering, adjustment/requeue, completion; SQS coordinator idempotency, killed-worker redelivery, poison-job DLQ (SQS tests need LocalStack) |
+| `internal/dispatch` | cross-worker claims, priority ordering, adjustment/requeue, completion; SQS coordinator idempotency, killed-worker redelivery, poison-job DLQ (SQS tests need LocalStack); sandboxed jobs: every failure class dead-lettered (fake runner), and end-to-end real Docker + LocalStack DLQ test |
+| `internal/sandbox` | spec validation, exit classification, exact docker flags, hardening verification (fail closed), timeout kill, output cap, orphan sweep with a fake docker; real-Docker tests for exit/timeout/OOM/no-network/read-only fs/dropped caps/pid limit (skip without Docker) |
 | `internal/sqsqueue` | tier priority order, visibility-timeout redelivery, DLQ after maxReceiveCount, immediate release (needs LocalStack) |
 | `internal/triage` | retry/adjust/escalate policy, retry limits, mocked LLM response parsing |
 | `internal/resource` | fit/reserve/release, best-fit slack selection, no-fit case |

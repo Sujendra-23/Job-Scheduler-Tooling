@@ -9,6 +9,7 @@ import (
 
 	"scheduler/internal/inference"
 	"scheduler/internal/resource"
+	"scheduler/internal/sandbox"
 )
 
 type JobState int
@@ -42,6 +43,11 @@ type Job struct {
 	Inference   inference.Batch
 	Attempt     int
 	MaxAttempts int
+
+	// Sandbox, when set, marks an untrusted job: it runs only inside a Docker
+	// sandbox (internal/sandbox) and its failures are dead-lettered.
+	Sandbox *sandbox.Spec `json:",omitempty"`
+
 	// InjectFailure is consumed by a worker on the first attempt. It makes
 	// failure handling reproducible instead of depending on flaky hardware.
 	InjectFailure string

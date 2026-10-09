@@ -67,6 +67,10 @@ func NewBroker(agent triage.Agent, recorder *telemetry.Recorder) *Broker {
 }
 
 func (b *Broker) Submit(job *queue.Job) error {
+	if job.Sandbox != nil {
+		// The in-process broker has no dead-letter queue and its workers do not sandbox.
+		return fmt.Errorf("job %s: sandboxed jobs require -queue-backend sqs", job.ID)
+	}
 	if err := job.Inference.Validate(); err != nil {
 		return fmt.Errorf("job %s: %w", job.ID, err)
 	}

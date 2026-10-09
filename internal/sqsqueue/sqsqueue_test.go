@@ -139,3 +139,22 @@ func TestReleaseRedeliversImmediately(t *testing.T) {
 		t.Fatalf("expected immediate redelivery, got %+v", d2)
 	}
 }
+
+func TestDeadLetterCarriesFailureClassAndDetail(t *testing.T) {
+	q := newTestQueues(t, 30*time.Second, 3)
+	ctx := context.Background()
+	if err := q.DeadLetter(ctx, job(t, "sandboxed", 3), "timeout", "exceeded the 5s wall-clock limit"); err != nil {
+		t.Fatal(err)
+	}
+	var dead []DeadLetter
+	for i := 0; i < 20 && len(dead) == 0; i++ {
+		var err error
+		if dead, err = q.PeekDeadLetters(ctx); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(dead) != 1 || dead[0].Job.ID != "sandboxed" || dead[0].Class != "timeout" || dead[0].Detail != "exceeded the 5s wall-clock limit" {
+		t.Fatalf("dead letters = %+v", dead)
+	}
+}
