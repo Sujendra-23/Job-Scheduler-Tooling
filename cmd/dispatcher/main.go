@@ -105,6 +105,7 @@ func runWorker(args []string) error {
 	sqsEndpoint := fs.String("sqs-endpoint", os.Getenv("SQS_ENDPOINT"), "SQS endpoint override (LocalStack)")
 	sqsRegion := fs.String("sqs-region", "us-east-1", "SQS region")
 	sqsPrefix := fs.String("sqs-prefix", "sched", "SQS queue name prefix")
+	sandboxMode := fs.String("sandbox", "", "run jobs that carry a sandbox spec in: docker (sqs backend only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -112,7 +113,7 @@ func runWorker(args []string) error {
 		return errors.New("worker requires -broker and -worker-id")
 	}
 	if *queueBackend == "sqs" {
-		return runSQSWorker(*brokerAddress, *workerID, *python, *runnerScript, *backend,
+		return runSQSWorker(*brokerAddress, *workerID, *python, *runnerScript, *backend, *sandboxMode,
 			sqsqueue.Config{Endpoint: *sqsEndpoint, Region: *sqsRegion, Prefix: *sqsPrefix})
 	}
 
@@ -200,8 +201,12 @@ func runCoordinator(args []string) error {
 	sqsKeep := fs.Bool("sqs-keep-queues", false, "do not delete the SQS queues on exit")
 	chaosHang := fs.Int("chaos-hang", 0, "sqs only: this many jobs make their first worker stall and get SIGKILLed (redelivery demo)")
 	chaosPoison := fs.Int("chaos-poison", 0, "sqs only: this many jobs kill every worker that receives them (DLQ demo)")
+	sandboxDemo := fs.Int("sandbox-demo", 0, "sqs only: make the first N jobs untrusted Docker-sandboxed jobs (ok, exit 3, timeout, OOM, network, read-only fs); failures go to the DLQ")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *sandboxDemo > 0 && *queueBackend != "sqs" {
+		return errors.New("-sandbox-demo requires -queue-backend sqs (the dead-letter queue lives there)")
 	}
 	if *numJobs < 1 || *numWorkers < 1 {
 		return errors.New("jobs and workers must be positive")
@@ -237,7 +242,7 @@ func runCoordinator(args []string) error {
 		return runSQSCoordinator(sqsCoordinatorOpts{
 			jobs: *numJobs, workers: *numWorkers, seed: *seed, failureRate: *failureRate,
 			backend: *backend, python: *python, runner: *runnerScript, out: *out,
-			agent: agent, recorder: recorder, chaosHang: *chaosHang, chaosPoison: *chaosPoison, keepQueues: *sqsKeep,
+			agent: agent, recorder: recorder, chaosHang: *chaosHang, chaosPoison: *chaosPoison, sandboxDemo: *sandboxDemo, keepQueues: *sqsKeep,
 			sqs: sqsqueue.Config{
 				Endpoint: *sqsEndpoint, Region: *sqsRegion, Prefix: *sqsPrefix,
 				VisibilityTimeout: time.Duration(*sqsVisibility) * time.Second, MaxReceiveCount: *sqsMaxReceive,

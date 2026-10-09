@@ -107,7 +107,13 @@ func NewSQSCoordinator(agent triage.Agent, recorder *telemetry.Recorder, qs *sqs
 }
 
 func (c *SQSCoordinator) Submit(ctx context.Context, job *queue.Job) error {
-	if err := job.Inference.Validate(); err != nil {
+	var err error
+	if job.Sandbox != nil {
+		err = job.Sandbox.Validate()
+	} else {
+		err = job.Inference.Validate()
+	}
+	if err != nil {
 		return fmt.Errorf("job %s: %w", job.ID, err)
 	}
 	c.mu.Lock()
@@ -260,8 +266,11 @@ func (c *SQSCoordinator) WatchDeadLetters(ctx context.Context, every time.Durati
 			}
 			c.terminal[d.Job.ID] = "dead_lettered"
 			c.stats.DeadLettered++
-			c.record(d.Job, "dead_lettered", "", d.Job.Attempt, fmt.Sprintf(
-				"exceeded maxReceiveCount=%d without an ack; moved to DLQ (message %s)", c.qs.Config().MaxReceiveCount, d.MessageID))
+			detail := fmt.Sprintf("exceeded maxReceiveCount=%d without an ack; moved to DLQ (message %s)", c.qs.Config().MaxReceiveCount, d.MessageID)
+			if d.Class != "" { // sent to the DLQ explicitly, e.g. by the sandbox
+				detail = fmt.Sprintf("%s: %s (message %s)", d.Class, d.Detail, d.MessageID)
+			}
+			c.record(d.Job, "dead_lettered", "", d.Job.Attempt, detail)
 		}
 		c.maybeDoneLocked()
 		c.mu.Unlock()
@@ -314,6 +323,13 @@ type Runner func(job *queue.Job, attempt int) (inference.Result, error)
 // be redelivered after the visibility timeout. It returns nil when the
 // coordinator reports everything terminal, or ctx.Err() on cancellation.
 func RunSQSWorker(ctx context.Context, qs *sqsqueue.Queues, ctl Control, workerID string, run Runner) error {
+	return RunSQSWorkerWith(ctx, qs, ctl, workerID, run, WorkerOptions{})
+}
+
+// RunSQSWorkerWith is RunSQSWorker with optional capabilities (see
+// WorkerOptions). Jobs that carry a Sandbox spec never reach run: they go to
+// the sandbox runner, and failures to the dead-letter queue.
+func RunSQSWorkerWith(ctx context.Context, qs *sqsqueue.Queues, ctl Control, workerID string, run Runner, opts WorkerOptions) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -356,6 +372,13 @@ func RunSQSWorker(ctx context.Context, qs *sqsqueue.Queues, ctl Control, workerI
 			// this process is expected to kill it; SQS then redelivers.
 			<-ctx.Done()
 			return ctx.Err()
+		}
+
+		if job.Sandbox != nil {
+			if err := runSandboxedJob(ctx, qs, ctl, opts, workerID, d, attempt); err != nil {
+				return err
+			}
+			continue
 		}
 
 		result, runErr := run(job, attempt)

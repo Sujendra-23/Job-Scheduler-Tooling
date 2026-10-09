@@ -80,12 +80,22 @@ type Delivery struct {
 	receipt  string
 }
 
-// DeadLetter is a message observed in the DLQ.
+// DeadLetter is a message observed in the DLQ. Class and Detail are set for
+// jobs sent there explicitly with Queues.DeadLetter (for example a sandbox
+// timeout); they are empty for messages SQS redrove after MaxReceiveCount.
 type DeadLetter struct {
 	Job          *queue.Job
 	MessageID    string
 	ReceiveCount int
+	Class        string
+	Detail       string
 }
+
+const (
+	attrFailureClass  = "FailureClass"
+	attrFailureDetail = "FailureDetail"
+	maxDetailLen      = 1024
+)
 
 func newClient(ctx context.Context, cfg Config) (*sqs.Client, error) {
 	opts := []func(*config.LoadOptions) error{config.WithRegion(cfg.Region)}
@@ -248,11 +258,35 @@ func (q *Queues) Release(ctx context.Context, d *Delivery) error {
 	return err
 }
 
+// DeadLetter puts a job directly into the DLQ with the reason it failed. The
+// message body is the job itself, so redrive and PeekDeadLetters treat it like
+// any message SQS moved there; the reason travels as message attributes.
+func (q *Queues) DeadLetter(ctx context.Context, job *queue.Job, class, detail string) error {
+	body, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+	if len(detail) > maxDetailLen {
+		detail = detail[:maxDetailLen]
+	}
+	str := func(v string) types.MessageAttributeValue {
+		return types.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(v)}
+	}
+	_, err = q.client.SendMessage(ctx, &sqs.SendMessageInput{
+		QueueUrl: aws.String(q.dlqURL), MessageBody: aws.String(string(body)),
+		MessageAttributes: map[string]types.MessageAttributeValue{
+			attrFailureClass: str(class), attrFailureDetail: str(detail),
+		},
+	})
+	return err
+}
+
 // PeekDeadLetters lists DLQ messages without hiding them from other peeks
 // (visibility 0), so the DLQ keeps its contents for inspection/redrive.
 func (q *Queues) PeekDeadLetters(ctx context.Context) ([]DeadLetter, error) {
 	out, err := q.client.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl: aws.String(q.dlqURL), MaxNumberOfMessages: 10, VisibilityTimeout: 0,
+		MessageAttributeNames:       []string{"All"},
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{types.MessageSystemAttributeNameApproximateReceiveCount},
 	})
 	if err != nil {
@@ -265,7 +299,14 @@ func (q *Queues) PeekDeadLetters(ctx context.Context) ([]DeadLetter, error) {
 			return nil, errors.New("undecodable DLQ message " + aws.ToString(m.MessageId))
 		}
 		rc, _ := strconv.Atoi(m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
-		res = append(res, DeadLetter{Job: &job, MessageID: aws.ToString(m.MessageId), ReceiveCount: rc})
+		dl := DeadLetter{Job: &job, MessageID: aws.ToString(m.MessageId), ReceiveCount: rc}
+		if a, ok := m.MessageAttributes[attrFailureClass]; ok {
+			dl.Class = aws.ToString(a.StringValue)
+		}
+		if a, ok := m.MessageAttributes[attrFailureDetail]; ok {
+			dl.Detail = aws.ToString(a.StringValue)
+		}
+		res = append(res, dl)
 	}
 	return res, nil
 }

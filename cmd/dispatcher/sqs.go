@@ -15,6 +15,7 @@ import (
 	"scheduler/internal/dispatch"
 	"scheduler/internal/inference"
 	"scheduler/internal/queue"
+	"scheduler/internal/sandbox"
 	"scheduler/internal/sqsqueue"
 	"scheduler/internal/telemetry"
 	"scheduler/internal/triage"
@@ -36,7 +37,7 @@ func (r rpcControl) Status(a dispatch.StatusArgs, reply *dispatch.StatusReply) e
 // runSQSWorker is the worker process body when -queue-backend=sqs: it pulls
 // batches straight from SQS and only uses the coordinator RPC for telemetry,
 // triage and shutdown.
-func runSQSWorker(brokerAddr, workerID, python, runnerScript, backend string, cfg sqsqueue.Config) error {
+func runSQSWorker(brokerAddr, workerID, python, runnerScript, backend, sandboxMode string, cfg sqsqueue.Config) error {
 	client, err := rpc.Dial("tcp", brokerAddr)
 	if err != nil {
 		return fmt.Errorf("dial coordinator: %w", err)
@@ -61,7 +62,44 @@ func runSQSWorker(brokerAddr, workerID, python, runnerScript, backend string, cf
 		}
 		return runner.Run(job.Inference)
 	}
-	return dispatch.RunSQSWorker(context.Background(), qs, rpcControl{client}, workerID, run)
+	opts := dispatch.WorkerOptions{Logf: func(format string, args ...any) { fmt.Printf(format+"\n", args...) }}
+	switch sandboxMode {
+	case "":
+	case "docker":
+		docker := &sandbox.DockerRunner{}
+		// A previous worker killed mid-job leaves its container running; reap expired ones.
+		if n, err := docker.Sweep(context.Background()); err == nil && n > 0 {
+			fmt.Printf("%s: removed %d expired sandbox container(s)\n", workerID, n)
+		}
+		opts.Sandbox = docker
+	default:
+		return fmt.Errorf("unknown -sandbox %q (want docker)", sandboxMode)
+	}
+	return dispatch.RunSQSWorkerWith(context.Background(), qs, rpcControl{client}, workerID, run, opts)
+}
+
+// sandboxDemoJob returns the i-th job of a fixed mix that exercises every way a
+// sandboxed run can end: success, non-zero exit, timeout, OOM kill, and two
+// boundary violations (network, read-only filesystem).
+func sandboxDemoJob(i int) *sandbox.Spec {
+	image := "alpine:3.20"
+	sh := func(script string, timeout int) *sandbox.Spec {
+		return &sandbox.Spec{Image: image, Cmd: []string{"sh", "-c", script}, CPUs: 0.5, MemoryMB: 64, TimeoutS: timeout}
+	}
+	switch i % 6 {
+	case 0:
+		return sh("echo ok", 20)
+	case 1:
+		return sh("echo failing >&2; exit 3", 20)
+	case 2:
+		return sh("sleep 120", 3)
+	case 3:
+		return sh("tail /dev/zero", 20)
+	case 4:
+		return sh("wget -T 3 -q -O- http://1.1.1.1/", 20)
+	default:
+		return sh("echo x > /etc/x", 20)
+	}
 }
 
 type sqsCoordinatorOpts struct {
@@ -73,6 +111,7 @@ type sqsCoordinatorOpts struct {
 	agent                  triage.Agent
 	recorder               *telemetry.Recorder
 	chaosHang, chaosPoison int
+	sandboxDemo            int
 	keepQueues             bool
 	sqs                    sqsqueue.Config
 }
@@ -129,6 +168,11 @@ func runSQSCoordinator(o sqsCoordinatorOpts) error {
 		}
 	}
 
+	// Sandbox demo: the first N jobs become untrusted Docker-sandboxed jobs.
+	for i := 0; i < o.sandboxDemo && i < len(jobs); i++ {
+		jobs[i].Sandbox, jobs[i].InjectFailure = sandboxDemoJob(i), ""
+	}
+
 	executable, err := os.Executable()
 	if err != nil {
 		return err
@@ -150,6 +194,9 @@ func runSQSCoordinator(o sqsCoordinatorOpts) error {
 		cmd := exec.Command(executable, "worker", "-broker", listener.Addr().String(), "-worker-id", id,
 			"-python", o.python, "-runner", o.runner, "-backend", o.backend,
 			"-queue-backend", "sqs", "-sqs-endpoint", o.sqs.Endpoint, "-sqs-region", o.sqs.Region, "-sqs-prefix", o.sqs.Prefix)
+		if o.sandboxDemo > 0 {
+			cmd.Args = append(cmd.Args, "-sandbox", "docker")
+		}
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start %s: %w", id, err)
