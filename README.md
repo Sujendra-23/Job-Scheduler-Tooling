@@ -50,6 +50,7 @@ internal/devices/     registry, simulated lossy network + device workers
 ml/                   persistent ResNet-50 / CPU-reference inference runner
 internal/dispatch/    synchronized priority broker and job lifecycle; SQS-backed coordinator + worker loop
 internal/sqsqueue/    SQS queue-per-priority-tier + DLQ wrapper (LocalStack-tested)
+serverless/           API Gateway submit, SQS Lambda worker, Step Functions lifecycle + LocalStack tests
 internal/inference/   typed ResNet-50 batch and result contracts
 internal/resource/    node capacity model + best-fit placement
 internal/queue/        priority heap with FIFO-within-tier ordering
@@ -195,13 +196,36 @@ inference-000: started x3 (each holder killed) -> dead_lettered
 inference-001: started (worker killed) -> redelivered after the visibility timeout -> started on another worker -> completed
 ```
 
-Caveats: tested against **LocalStack 3.8 only**, not real AWS SQS (real SQS
+Caveats: tested against **LocalStack 3.8 and 4.14.0**, not real AWS SQS (real SQS
 short-polling can return empty on a non-empty queue and visibility expiry is
 not instantaneous; the worker loop just re-polls). There is no visibility
 heartbeat, so a job that legitimately runs longer than the visibility timeout
 would be redelivered while still running (and then deduplicated by the
 coordinator). Workers still call a single-host coordinator over RPC for
 telemetry/triage; only the queue itself moved to SQS.
+
+## API Gateway + Lambda + Step Functions (LocalStack)
+
+The optional serverless path adds `POST /jobs` to enqueue the existing
+Go-compatible inference jobs on the five SQS priority queues. An SQS-triggered
+Lambda starts a durable Step Functions lifecycle: run inference, retry transient
+failures with exponential backoff, complete, or send exhausted/permanent
+failures to the shared DLQ. Failed workflow handoffs use native SQS redrive;
+duplicate SQS deliveries reuse the same execution identity.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r serverless/requirements.txt
+make localstack-up
+make serverless-deploy       # prints the POST /jobs URL
+make serverless-test
+make serverless-integration  # actual HTTP, SQS triggers, Lambda containers, workflows
+```
+
+This path uses the existing CPU reference inference model and consumes priority
+tiers concurrently. See [serverless/README.md](serverless/README.md) for the
+request contract, lifecycle, queue reuse, failure demos, limitations, and cleanup.
 
 ## Device registry with versioned config push (single-host simulation)
 

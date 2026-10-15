@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: API Gateway submission and Lambda/Step Functions lifecycle on existing scheduler SQS queues
+Parameters:
+  CodeBucket: {Type: String}
+  CodeKey: {Type: String}
+  Queue1Arn: {Type: String}
+  Queue2Arn: {Type: String}
+  Queue3Arn: {Type: String}
+  Queue4Arn: {Type: String}
+  Queue5Arn: {Type: String}
+  QueueUrls: {Type: String, Description: JSON object mapping tiers 1 through 5 to existing queue URLs}
+  DLQUrl: {Type: String}
+  DLQArn: {Type: String}
+  AllowFailureInjection: {Type: String, Default: 'false', AllowedValues: ['true', 'false']}
+Resources:
+  SubmitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: enqueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sqs:SendMessage'
+                Resource: [{Ref: Queue1Arn}, {Ref: Queue2Arn}, {Ref: Queue3Arn}, {Ref: Queue4Arn}, {Ref: Queue5Arn}]
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+      Policies:
+        - PolicyName: consume-and-start
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes']
+                Resource: [{Ref: Queue1Arn}, {Ref: Queue2Arn}, {Ref: Queue3Arn}, {Ref: Queue4Arn}, {Ref: Queue5Arn}]
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: {Ref: Lifecycle}
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole']
+  LifecycleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: run-and-dead-letter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - {Effect: Allow, Action: 'lambda:InvokeFunction', Resource: {Fn::GetAtt: [InferenceTask, Arn]}}
+              - {Effect: Allow, Action: 'sqs:SendMessage', Resource: {Ref: DLQArn}}
+  Submit:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: handlers.submit
+      Timeout: 10
+      Role: {Fn::GetAtt: [SubmitRole, Arn]}
+      Code: {S3Bucket: {Ref: CodeBucket}, S3Key: {Ref: CodeKey}}
+      Environment:
+        Variables:
+          TIER_QUEUE_URLS: {Ref: QueueUrls}
+          ALLOW_FAILURE_INJECTION: {Ref: AllowFailureInjection}
+  Worker:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: handlers.start_jobs
+      Timeout: 5
+      Role: {Fn::GetAtt: [WorkerRole, Arn]}
+      Code: {S3Bucket: {Ref: CodeBucket}, S3Key: {Ref: CodeKey}}
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: {Ref: Lifecycle}
+          ALLOW_FAILURE_INJECTION: {Ref: AllowFailureInjection}
+  InferenceTask:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: handlers.run_job
+      Timeout: 20
+      MemorySize: 256
+      Role: {Fn::GetAtt: [TaskRole, Arn]}
+      Code: {S3Bucket: {Ref: CodeBucket}, S3Key: {Ref: CodeKey}}
+      Environment:
+        Variables:
+          INFERENCE_BACKEND: cpu-reference
+          ALLOW_FAILURE_INJECTION: {Ref: AllowFailureInjection}
+  Lifecycle:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: STANDARD
+      RoleArn: {Fn::GetAtt: [LifecycleRole, Arn]}
+      Definition:
+        Comment: Durable inference lifecycle; SQS redrive covers failures before handoff
+        StartAt: RunJob
+        TimeoutSeconds: 300
+        States:
+          RunJob:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            TimeoutSeconds: 25
+            Parameters:
+              FunctionName: {Fn::GetAtt: [InferenceTask, Arn]}
+              Payload:
+                job.$: $.job
+                retry_count.$: $$.State.RetryCount
+            ResultPath: $.completion
+            Retry:
+              - ErrorEquals: [PermanentJobError]
+                MaxAttempts: 0
+              - ErrorEquals: [States.TaskFailed, States.Timeout]
+                IntervalSeconds: 1
+                BackoffRate: 2
+                MaxAttempts: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: DeadLetter
+            Next: Completed
+          Completed:
+            Type: Succeed
+            OutputPath: $.completion.Payload
+          DeadLetter:
+            Type: Task
+            Resource: arn:aws:states:::sqs:sendMessage
+            Parameters:
+              QueueUrl: {Ref: DLQUrl}
+              MessageBody.$: States.JsonToString($.job)
+              MessageAttributes:
+                Error: {DataType: String, StringValue.$: $.failure.Error}
+                Cause: {DataType: String, StringValue.$: $.failure.Cause}
+                ExecutionArn: {DataType: String, StringValue.$: $$.Execution.Id}
+            ResultPath: $.dead_letter
+            Retry:
+              - ErrorEquals: [States.ALL]
+                IntervalSeconds: 1
+                BackoffRate: 2
+                MaxAttempts: 3
+            Next: Failed
+          Failed:
+            Type: Fail
+            Error: JobDeadLettered
+            Cause: Inference failed; original job and error attributes were sent to the DLQ
+  Tier1Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: {Ref: Queue1Arn}
+      FunctionName: {Ref: Worker}
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  Tier2Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: {Ref: Queue2Arn}
+      FunctionName: {Ref: Worker}
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  Tier3Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: {Ref: Queue3Arn}
+      FunctionName: {Ref: Worker}
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  Tier4Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: {Ref: Queue4Arn}
+      FunctionName: {Ref: Worker}
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  Tier5Mapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: {Ref: Queue5Arn}
+      FunctionName: {Ref: Worker}
+      BatchSize: 1
+      FunctionResponseTypes: [ReportBatchItemFailures]
+  API:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: {Fn::Sub: '${AWS::StackName}-jobs'}
+  JobsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: {Ref: API}
+      ParentId: {Fn::GetAtt: [API, RootResourceId]}
+      PathPart: jobs
+  SubmitMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: {Ref: API}
+      ResourceId: {Ref: JobsResource}
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub: 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${Submit.Arn}/invocations'
+  SubmitPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: {Ref: Submit}
+      Principal: apigateway.amazonaws.com
+      SourceArn: {Fn::Sub: 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${API}/*/POST/jobs'}
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: SubmitMethod
+    Properties:
+      RestApiId: {Ref: API}
+      StageName: local
+Outputs:
+  ApiId: {Value: {Ref: API}}
+  StateMachineArn: {Value: {Ref: Lifecycle}}
+  WorkerName: {Value: {Ref: Worker}}
+  SubmitName: {Value: {Ref: Submit}}
+  TaskName: {Value: {Ref: InferenceTask}}

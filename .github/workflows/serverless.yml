@@ -1,0 +1,27 @@
+name: Serverless lifecycle
+on:
+  push:
+  pull_request:
+jobs:
+  localstack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r serverless/requirements.txt
+      - run: make localstack-up
+      - run: make serverless-test
+      - run: SQS_ENDPOINT=http://localhost:4566 go test -race ./...
+      - run: make serverless-integration
+      - name: LocalStack diagnostics
+        if: failure()
+        run: docker compose -f compose.serverless.yaml logs --no-color --tail 300
+      - name: Stop LocalStack
+        if: always()
+        run: make localstack-down

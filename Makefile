@@ -1,4 +1,23 @@
-.PHONY: build run-distributed run-sim run-sim-pg trace allocator test clean
+.PHONY: build run-distributed run-sim run-sim-pg trace allocator test clean localstack-up localstack-down serverless-deploy serverless-test serverless-integration
+.DEFAULT_GOAL := build
+
+# Use a virtual environment with serverless/requirements.txt installed.
+PYTHON ?= python3
+
+localstack-up:
+	docker compose -f compose.serverless.yaml up -d --wait
+
+localstack-down:
+	docker compose -f compose.serverless.yaml down
+
+serverless-deploy:
+	$(PYTHON) serverless/deploy.py --create-queues
+
+serverless-test:
+	$(PYTHON) -m unittest discover -s serverless/tests -v
+
+serverless-integration:
+	RUN_LOCALSTACK_TESTS=1 $(PYTHON) -m unittest discover -s serverless/tests -p test_localstack.py -v
 
 build:
 	go build -o bin/scheduler ./cmd/scheduler
